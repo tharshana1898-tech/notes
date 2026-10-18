@@ -101,6 +101,14 @@ button{cursor:pointer}
 .welcome .row{display:flex;gap:8px;flex-wrap:wrap}
 .big{border:0;border-radius:14px;padding:11px 16px;font-weight:800;background:var(--accent);color:var(--surface)}
 .big.alt{background:var(--surface-2);color:var(--ink)}
+.safe{background:var(--surface);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 0 var(--line-ui)}
+.safe .sec-head{margin:0}
+.safe-note{margin:0;font-size:13px;color:var(--muted)}
+.safe .row,.welcome .row{display:flex;gap:8px;flex-wrap:wrap}
+.safe .big{padding:9px 12px;font-size:13px}
+.banner{background:var(--accent-soft);border-radius:16px;padding:12px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px;font-weight:700}
+.banner .big{padding:8px 12px;font-size:13px;margin-left:auto}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom, 0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-weight:700;z-index:50;max-width:calc(100% - 32px);box-shadow:0 6px 20px var(--shadow)}
 
 /* ---------- editor ---------- */
 .ed-pane{position:relative}
@@ -348,22 +356,21 @@ const overrides = new Map();   // id -> data | null (deleted), pending local wri
 const pending = new Map(), inflight = new Set();
 let definitive = false, saveErr = "";
 
-function items() { const m = new Map(remote); for (const [k, v] of overrides) { if (v === null) m.delete(k); else m.set(k, v); } return m; }
+function items() { const m = new Map(); for (const [k, v] of remote) if (v && v.type !== "tomb") m.set(k, v); for (const [k, v] of overrides) { if (v === null) m.delete(k); else m.set(k, v); } return m; }
 
 function setStatus() {
   const s = $("#status");
   if (saveErr) { s.textContent = saveErr; s.dataset.s = "err"; return; }
   s.dataset.s = "";
   if (mode === "loading") s.textContent = "Opening…";
-  else if (mode === "device") s.textContent = "Saved on this device";
+  else if (mode === "device") s.textContent = fileState === "linked" ? "Saved to your file" : fileState === "needs-permission" ? "File not connected" : "Saved on this device";
   else s.textContent = (pending.size || inflight.size) ? "Saving…" : "Saved";
 }
 
 function put(id, data) {
   if (mode === "device") {
-    if (data === null) remote.delete(id); else remote.set(id, data);
-    lsSet(LS_KEY, JSON.stringify(Object.fromEntries(remote)));
-    setStatus(); return;
+    remote.set(id, data === null ? {type:"tomb", _t:Date.now()} : {...data, _t:Date.now()});
+    saveLocal(); setStatus(); return;
   }
   if (mode !== "cloud") return;
   overrides.set(id, data); pending.set(id, data);
@@ -412,7 +419,128 @@ async function initStore() {
   }
   mode = "device"; definitive = true;
   try { const raw = lsGet(LS_KEY); if (raw) remote = new Map(Object.entries(JSON.parse(raw))); } catch {}
-  setStatus(); onData();
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch {}
+  setStatus(); onData(); initFile();
+}
+
+/* ================= keeping notes safe (device mode) ================= */
+const stamp = v => (v && (v._t || v.updated || v.created)) || 0;
+function mergeIn(obj) {
+  let n = 0;
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (!v || typeof v !== "object" || !["folder","note","tomb"].includes(v.type) || !/^[A-Za-z0-9_-]{1,80}$/.test(k)) continue;
+    const cur = remote.get(k);
+    if (!cur || stamp(v) > stamp(cur)) { remote.set(k, v); if (v.type !== "tomb") n++; }
+  }
+  return n;
+}
+function saveLocal() { lsSet(LS_KEY, JSON.stringify(Object.fromEntries(remote))); queueFileWrite(); }
+function exportJSON() { return JSON.stringify({app:"dandelune", version:1, exported:new Date().toISOString(), items:Object.fromEntries(remote)}); }
+function parseBackup(text) {
+  const d = JSON.parse(text);
+  if (!d || typeof d.items !== "object" || !d.items) throw new Error("not a backup");
+  return d.items;
+}
+function toast(t) {
+  let e = $("#toast");
+  if (!e) { e = el("div", {id:"toast", class:"toast", role:"status"}); document.body.append(e); }
+  e.textContent = t; e.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { e.hidden = true; }, 3200);
+}
+function downloadBackup() {
+  const blob = new Blob([exportJSON()], {type:"application/json"});
+  const url = URL.createObjectURL(blob);
+  const a = el("a", {href:url, download:`dandelune-backup-${new Date().toISOString().slice(0,10)}.json`});
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  lsSet("dandelune-last-backup", String(Date.now()));
+  toast("Backup saved to your downloads"); renderLib();
+}
+const restoreIn = el("input", {type:"file", accept:".json,application/json", hidden:"", id:"restoreIn"});
+document.body.append(restoreIn);
+restoreIn.addEventListener("change", async () => {
+  const f = restoreIn.files && restoreIn.files[0]; restoreIn.value = "";
+  if (!f) return;
+  try {
+    const n = mergeIn(parseBackup(await f.text()));
+    saveLocal(); onData();
+    toast(n ? `Restored ${n} folder${n > 1 ? "s and pages" : " or page"}` : "Everything in that backup is already here");
+  } catch { toast("That file isn't a Dandelune backup. Pick a file named dandelune-backup."); }
+});
+
+// Save straight into a file on this computer (Chrome and Edge on a computer)
+const fsSupported = typeof window.showSaveFilePicker === "function" && typeof window.showOpenFilePicker === "function";
+let fileHandle = null, fileState = "none"; // none | linked | needs-permission
+const FILE_TYPES = [{description:"Dandelune notes", accept:{"application/json":[".json"]}}];
+const kv = (() => {
+  let p;
+  const open = () => p || (p = new Promise((res, rej) => { const r = indexedDB.open("dandelune", 1); r.onupgradeneeded = () => r.result.createObjectStore("kv"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }));
+  const tx = (mode, fn) => open().then(db => new Promise((res, rej) => { const t = db.transaction("kv", mode); const q = fn(t.objectStore("kv")); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
+  return { get: k => tx("readonly", s => s.get(k)), set: (k, v) => tx("readwrite", s => s.put(v, k)), del: k => tx("readwrite", s => s.delete(k)) };
+})();
+async function linkFile(h, read) {
+  fileHandle = h;
+  if (read) { const txt = await (await h.getFile()).text(); if (txt.trim()) mergeIn(parseBackup(txt)); }
+  fileState = "linked";
+  try { await kv.set("file", h); } catch {}
+  lsSet(LS_KEY, JSON.stringify(Object.fromEntries(remote)));
+  await writeFileNow(); onData();
+}
+let fileTimer = null, writing = false, writeAgain = false;
+function queueFileWrite() { if (fileState !== "linked") return; clearTimeout(fileTimer); fileTimer = setTimeout(writeFileNow, 500); }
+async function writeFileNow() {
+  if (fileState !== "linked" || !fileHandle) return;
+  if (writing) { writeAgain = true; return; }
+  writing = true;
+  try { const w = await fileHandle.createWritable(); await w.write(exportJSON()); await w.close(); }
+  catch { fileState = "needs-permission"; renderLib(); }
+  writing = false; setStatus();
+  if (writeAgain) { writeAgain = false; writeFileNow(); }
+}
+async function createFile() {
+  try {
+    const h = await window.showSaveFilePicker({suggestedName:"dandelune-notes.json", types:FILE_TYPES});
+    await linkFile(h, false); toast("Your notes now save to " + h.name);
+  } catch (e) { if (!e || e.name !== "AbortError") toast("Couldn't create the file. Try a folder like Documents."); }
+}
+async function openFile() {
+  try {
+    const [h] = await window.showOpenFilePicker({types:FILE_TYPES, multiple:false});
+    if ((await h.requestPermission({mode:"readwrite"})) !== "granted") return;
+    await linkFile(h, true); toast("Notes file connected");
+  } catch (e) { if (!e || e.name !== "AbortError") toast("That file couldn't be opened. Pick your dandelune-notes file."); }
+}
+async function reconnectFile() {
+  try {
+    if ((await fileHandle.requestPermission({mode:"readwrite"})) === "granted") { await linkFile(fileHandle, true); toast("Notes file reconnected"); }
+  } catch { toast("Couldn't reach the file. It may have been moved or renamed."); }
+}
+async function unlinkFile() {
+  fileHandle = null; fileState = "none";
+  try { await kv.del("file"); } catch {}
+  setStatus(); renderLib(); toast("File disconnected. Notes still save in this browser.");
+}
+async function initFile() {
+  if (!fsSupported) return;
+  try {
+    const h = await kv.get("file"); if (!h) return;
+    fileHandle = h;
+    if ((await h.queryPermission({mode:"readwrite"})) === "granted") await linkFile(h, true);
+    else { fileState = "needs-permission"; setStatus(); renderLib(); }
+  } catch {}
+}
+function safetyCard() {
+  const box = el("section", {class:"safe"}, el("div", {class:"sec-head"}, el("h2", {text:"Keep my notes safe"})));
+  const b = (t, fn, alt) => el("button", {class:"big" + (alt ? " alt" : ""), type:"button", text:t, onclick:fn});
+  if (fsSupported) {
+    if (fileState === "linked") box.append(el("p", {class:"safe-note", text:`Every change saves to “${fileHandle.name}” on this computer. Clearing the browser can't erase it.`}), el("div", {class:"row"}, b("Disconnect file", unlinkFile, true)));
+    else if (fileState !== "needs-permission") box.append(el("p", {class:"safe-note", text:"Save your notes into a real file on this computer, so clearing the browser can't erase them. Tip: put it in your OneDrive folder for a cloud copy too."}),
+      el("div", {class:"row"}, b("Create notes file", createFile), b("Open notes file", openFile, true)));
+  }
+  const last = +(lsGet("dandelune-last-backup") || 0);
+  box.append(el("p", {class:"safe-note", text: last ? `Last backup: ${fmtDate(last)}. Make a new one now and then.` : "No backup yet. Save one now and then, especially on your phone."}),
+    el("div", {class:"row"}, b("Back up my notes", downloadBackup), b("Restore from backup", () => restoreIn.click(), true)));
+  return box;
 }
 
 /* ================= state ================= */
@@ -462,6 +590,8 @@ function renderLib() {
   if (!fs.length && !ns.length) { body.append(welcomeCard()); return; }
 
   const wrap = el("div", {style:"display:flex;flex-direction:column;gap:18px"});
+  if (mode === "device" && fileState === "needs-permission") wrap.append(el("div", {class:"banner"}, el("span", {text:"Your notes file is waiting"}),
+    el("button", {class:"big", type:"button", text:"Reconnect file", onclick: reconnectFile})));
   const search = el("div", {class:"search"}, el("input", {id:"q", type:"search", placeholder:"Search all notes", "aria-label":"Search notes", autocomplete:"off"}));
   const qi = search.querySelector("input"); qi.value = query;
   qi.addEventListener("input", () => { query = qi.value; renderNotes(); });
@@ -487,6 +617,7 @@ function renderLib() {
   const nsec = el("section", {}, el("div", {class:"sec-head"}, el("h2", {id:"notesHead"}),
     el("button", {class:"pill", type:"button", text:"+ Page", onclick: newNote})), el("div", {id:"noteList"}));
   wrap.append(nsec);
+  if (mode === "device") wrap.append(safetyCard());
   body.append(wrap);
   renderNotes();
   if (renaming) { const r = body.querySelector(".frename"); if (r) { r.focus(); r.select(); } }
@@ -569,7 +700,12 @@ function welcomeCard() {
     el("p", {text:"Make folders, write on lined or blank paper, add borders, and drop hand-drawn stickers right into your words."}),
     el("div", {class:"row"},
       el("button", {class:"big", type:"button", text:"Start with sample pages", onclick: seedStarter}),
-      el("button", {class:"big alt", type:"button", text:"Start empty", onclick: () => { const id = addFolderRaw(null, "My notes"); selFolder = id; renderLib(); }})));
+      el("button", {class:"big alt", type:"button", text:"Start empty", onclick: () => { const id = addFolderRaw(null, "My notes"); selFolder = id; renderLib(); }})),
+    mode === "device" ? el("p", {text:"Already have notes from another device?"}) : null,
+    mode === "device" ? el("div", {class:"row"},
+      el("button", {class:"big alt", type:"button", text:"Restore from backup", onclick: () => restoreIn.click()}),
+      fsSupported ? el("button", {class:"big alt", type:"button", text:"Open notes file", onclick: openFile}) : null) : null,
+    mode === "device" && fileState === "needs-permission" ? el("div", {class:"row"}, el("button", {class:"big", type:"button", text:"Reconnect notes file", onclick: reconnectFile})) : null);
 }
 
 /* ================= folder + note actions ================= */
